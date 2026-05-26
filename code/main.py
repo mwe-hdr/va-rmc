@@ -319,13 +319,37 @@ rmc_emergency_ts["census"] = (
 )
 
 # --------------------------------------------------
+# NON-ACUITY ROLLUP (collapse across acuity)
+# --------------------------------------------------
+
+rmc_emergency_rollup = (
+    rmc_emergency_ts
+    .groupby("interval", as_index=False)["census"]
+    .sum()
+)
+
+# Ensure clean integer typing
+rmc_emergency_rollup["census"] = (
+    pd.to_numeric(rmc_emergency_rollup["census"], errors="coerce")
+    .round()
+    .astype("Int64")
+)
+
+# --------------------------------------------------
 # EXPORT OUTPUTS (Run folder)
 # --------------------------------------------------
 
-main_output = output_dir / f"{YEAR_PREFIX}_rmc_emergency_ts.csv"
-rmc_emergency_ts.to_csv(main_output, index=False)
+# --- ACUITY VERSION ---
+acuity_output = output_dir / f"{YEAR_PREFIX}_rmc_emergency_ts.acuity.csv"
+rmc_emergency_ts.to_csv(acuity_output, index=False)
 
-log(f"📤 Saved main output: {main_output} ({len(rmc_emergency_ts):,} rows)")
+log(f"📤 Saved acuity output: {acuity_output} ({len(rmc_emergency_ts):,} rows)")
+
+# --- NON-ACUITY ROLLUP ---
+rollup_output = output_dir / f"{YEAR_PREFIX}_rmc_emergency_ts.non-acuity-rollup.csv"
+rmc_emergency_rollup.to_csv(rollup_output, index=False)
+
+log(f"📤 Saved rollup output: {rollup_output} ({len(rmc_emergency_rollup):,} rows)")
 
 # Per-acuity
 for acuity, sub_df in rmc_emergency_ts.groupby('acuity_name'):
@@ -361,6 +385,18 @@ for year, year_df in rmc_emergency_ts.groupby("year"):
         sub_df.drop(columns=["year"]).to_csv(file_path, index=False)
 
         log(f"📤 Saved yearly acuity file: {file_path}")
+
+    # ---- NON-ACUITY YEAR ROLLUP ----
+    year_rollup = (
+        year_df
+        .groupby("interval", as_index=False)["census"]
+        .sum()
+    )
+
+    year_rollup_output = output_dir / f"{year}_rmc_emergency_ts.non-acuity-rollup.csv"
+    year_rollup.to_csv(year_rollup_output, index=False)
+
+    log(f"📤 Saved yearly rollup: {year_rollup_output}")
 
 # --------------------------------------------------
 # OPTIONAL: COPY FINAL OUTPUTS TO BASE /data/output
