@@ -358,8 +358,6 @@ for acuity, sub_df in rmc_emergency_ts.groupby('acuity_name'):
     sub_df.to_csv(file_path, index=False)
     log(f"📤 Saved acuity file: {file_path}")
 
-log(f"📤 Saved main output: {main_output} ({len(rmc_emergency_ts):,} rows)")
-
 # --------------------------------------------------
 # EXPORT PER-YEAR OUTPUTS
 # --------------------------------------------------
