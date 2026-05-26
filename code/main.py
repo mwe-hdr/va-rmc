@@ -589,6 +589,29 @@ for year, year_df in rmc_emergency_ts.groupby("year"):
 
     log(f"📤 Saved yearly rollup: {year_rollup_output}")
 
+    # ---- HYPER OUTPUTS PER YEAR ----
+
+    # Acuity Hyper (same schema as main)
+    year_hyper_path = output_dir / f"{year}_ed_census.hyper"
+
+    try:
+        write_census_hyper(
+            year_df.drop(columns=["year"]),
+            year_hyper_path
+        )
+    except Exception as e:
+        log(f"❌ Year {year} census hyper FAILED: {e}")
+
+    # Rollup Hyper (optional)
+    year_rollup_hyper_path = output_dir / f"{year}_ed_census.non-acuity-rollup.hyper"
+
+    try:
+        write_rollup_hyper(
+            year_rollup,
+            year_rollup_hyper_path
+        )
+    except Exception as e:
+        log(f"❌ Year {year} rollup hyper FAILED: {e}")
 
 # --------------------------------------------------
 # FINALIZE
