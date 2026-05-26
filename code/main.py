@@ -356,45 +356,7 @@ for acuity, sub_df in rmc_emergency_ts.groupby('acuity_name'):
     safe_name = acuity.replace(' ', '_').replace('-', '_')
     file_path = output_dir / f"{YEAR_PREFIX}_rmc_ed_{safe_name}.csv"
     sub_df.to_csv(file_path, index=False)
-    log(f"📤 Saved acuity file: {file_path}")
-
-# --------------------------------------------------
-# EXPORT PER-YEAR OUTPUTS
-# --------------------------------------------------
-
-log("📆 Creating per-year outputs...")
-
-# Add year column once
-rmc_emergency_ts["year"] = rmc_emergency_ts["interval"].dt.year
-
-for year, year_df in rmc_emergency_ts.groupby("year"):
-
-    # ---- FULL YEAR FILE ----
-    year_output = output_dir / f"{year}_rmc_emergency_ts.csv"
-    year_df.drop(columns=["year"]).to_csv(year_output, index=False)
-
-    log(f"📤 Saved yearly output: {year_output} ({len(year_df):,} rows)")
-
-    # ---- PER-ACUITY WITHIN YEAR ----
-    for acuity, sub_df in year_df.groupby("acuity_name"):
-        safe_name = acuity.replace(" ", "_").replace("-", "_")
-
-        file_path = output_dir / f"{year}_rmc_ed_{safe_name}.csv"
-        sub_df.drop(columns=["year"]).to_csv(file_path, index=False)
-
-        log(f"📤 Saved yearly acuity file: {file_path}")
-
-    # ---- NON-ACUITY YEAR ROLLUP ----
-    year_rollup = (
-        year_df
-        .groupby("interval", as_index=False)["census"]
-        .sum()
-    )
-
-    year_rollup_output = output_dir / f"{year}_rmc_emergency_ts.non-acuity-rollup.csv"
-    year_rollup.to_csv(year_rollup_output, index=False)
-
-    log(f"📤 Saved yearly rollup: {year_rollup_output}")
+    log(f"📤 Saved acuity file: {file_path}")  
 
 # --------------------------------------------------
 # OPTIONAL: COPY FINAL OUTPUTS TO BASE /data/output
@@ -588,6 +550,45 @@ try:
     write_uc_hyper(df, uc_hyper_path)
 except Exception as e:
     log(f"❌ UC hyper FAILED: {e}")
+
+# --------------------------------------------------
+# EXPORT PER-YEAR OUTPUTS
+# --------------------------------------------------
+
+log("📆 Creating per-year outputs...")
+
+# Add year column once
+rmc_emergency_ts["year"] = rmc_emergency_ts["interval"].dt.year
+
+for year, year_df in rmc_emergency_ts.groupby("year"):
+
+    # ---- FULL YEAR FILE ----
+    year_output = output_dir / f"{year}_rmc_emergency_ts.csv"
+    year_df.drop(columns=["year"]).to_csv(year_output, index=False)
+
+    log(f"📤 Saved yearly output: {year_output} ({len(year_df):,} rows)")
+
+    # ---- PER-ACUITY WITHIN YEAR ----
+    for acuity, sub_df in year_df.groupby("acuity_name"):
+        safe_name = acuity.replace(" ", "_").replace("-", "_")
+
+        file_path = output_dir / f"{year}_rmc_ed_{safe_name}.csv"
+        sub_df.drop(columns=["year"]).to_csv(file_path, index=False)
+
+        log(f"📤 Saved yearly acuity file: {file_path}")
+
+    # ---- NON-ACUITY YEAR ROLLUP ----
+    year_rollup = (
+        year_df
+        .groupby("interval", as_index=False)["census"]
+        .sum()
+    )
+
+    year_rollup_output = output_dir / f"{year}_rmc_emergency_ts.non-acuity-rollup.csv"
+    year_rollup.to_csv(year_rollup_output, index=False)
+
+    log(f"📤 Saved yearly rollup: {year_rollup_output}")
+
 
 # --------------------------------------------------
 # FINALIZE
