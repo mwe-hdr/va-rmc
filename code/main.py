@@ -607,4 +607,4 @@ for year, year_df in rmc_emergency_ts.groupby("year"):
 # --------------------------------------------------
 
 elapsed = time.perf_counter() - START_TIME
-log(f"✅ Completed in {elapsed:.2f} seconds")
+log(f"✅ Completed in {elapsed:.2f} seconds test git")
