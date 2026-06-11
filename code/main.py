@@ -342,7 +342,8 @@ for split in splits:
 
         if group_col == "room_category":
             df_model = df_model[
-                df_model["room_category"] != "Low Volume - Exclude"
+                (df_model["room_category"] != "Low Volume - Exclude") &
+                (df_model["room_category"] != "No Room")
             ].copy()
 
         # --------------------------------------------------
