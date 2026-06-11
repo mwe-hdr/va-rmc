@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 import pyodbc
 import numpy as np
@@ -84,8 +85,6 @@ conn = pyodbc.connect(
 
 log("✅ Connected to database")
 
-
-
 # --------------------------------------------------
 # LOAD DATA
 # --------------------------------------------------
@@ -94,9 +93,72 @@ df = pd.read_sql("SELECT * FROM rmc.emergency", conn)
 log(f"✅ Loaded {len(df):,} records from database")
 df_raw = df.copy()
 
+# --------------------------------------------------
+# ROOM CLUSTERING
+# --------------------------------------------------
+
+# Build room → cluster mapping
+room_cluster_map = {
+    # Cluster 0
+    **{room: 0 for room in [
+        "1403","1404","1405","1406","1407","1408","1409","1410","1411","1412",
+        "1413","1414","1415","1416","1417","1418","1419","1420","1421","1422",
+        "1423","1424","1425","1426","1427","1428","1429","1430","1431","1432",
+        "1433","1434","1435","1436","1437","1438","1439","1440","1441","1442",
+        "HALLJ1","HALLJ2","RMC OR","T1","T2"
+    ]},
+
+    # Cluster 1
+    **{room: 1 for room in [
+        "HALLG1","HALLI1","HALLI2",
+        "IR1","IR2","IR3","IR4","IR5","IR6","IR7","IR8",
+        "RP01","RP02","RP03","RP04","RP05","RP06","RP07","RP08",
+        "RP09","RP10","RP11","RP12","RP13","RP14","RP15","RP16",
+        "RP17","RP18","RP19","RP20","RP21","RP22","RP23","RP24",
+        "SR1","SR2","SR3"
+    ]},
+
+    # Cluster 2
+    **{room: 2 for room in [
+        "1501","1502","1503","1504","1505",
+        "1514","1515","1516","1517","1518"
+    ]}
+}
+
+# Step 2: cluster → label mapping
+cluster_label_map = {
+    0: "Inpatient / Core ED",
+    1: "Throughput / fast-track / hall care",
+    2: "Observation"
+}
+
+# categorizer function
+def categorize_room(room):
+    
+    # Handle nulls / blanks
+    if pd.isna(room) or str(room).strip() == "":
+        return "No Room"
+    
+    room = str(room).upper().strip()
+    
+    # Lookup cluster
+    cluster = room_cluster_map.get(room)
+    
+    if cluster is not None:
+        return cluster_label_map[cluster]
+    
+    # Default: not modeled (low volume / excluded)
+    return "Low Volume - Exclude"
+
+df["room_category"] = df["er_room"].apply(categorize_room)
+
+df_full = df.copy()
+
 splits = ["Psych", "Non-Psych"]
 
 for split in splits:
+    df = df_full.copy()
+    df_raw = df_full.copy()
     log(f"✅ Processing {split}...")
 
 # --------------------------------------------------
@@ -265,353 +327,378 @@ for split in splits:
         .fillna('0-Unknown')
     )
 
-    acuities = df['acuity_name'].unique()
+    grouping_columns = ["acuity_name"]
 
-    # --------------------------------------------------
-    # CLIP VISITS
-    # --------------------------------------------------
+    # Extend for Non-Psych
+    if split == "Non-Psych":
+        grouping_columns.append("room_category")
 
-    df['start'] = df['start_dtm'].clip(lower=year_start, upper=year_end)
-    df['end']   = df['end_dtm'].clip(lower=year_start, upper=year_end)
-    df['end']   = df['end'] + pd.Timedelta(minutes=1)
+    for group_col in grouping_columns:
 
-    # --------------------------------------------------
-    # EVENT ENGINE
-    # --------------------------------------------------
+        log(f"🔁 Running census for: {group_col}")
 
-    start_events = df[['acuity_name', 'start']].rename(columns={'start': 'interval'})
-    start_events['delta'] = 1
+        df_model = df.copy()
+        df_model["group_name"] = df_model[group_col]
 
-    end_events = df[['acuity_name', 'end']].rename(columns={'end': 'interval'})
-    end_events['delta'] = -1
+        if group_col == "room_category":
+            df_model = df_model[
+                df_model["room_category"] != "Low Volume - Exclude"
+            ].copy()
 
-    events = pd.concat([start_events, end_events])
+        # --------------------------------------------------
+        # CLIP VISITS
+        # --------------------------------------------------
 
-    events = events[
-        (events['interval'] >= year_start) &
-        (events['interval'] <= year_end)
-    ]
+        df_model['start'] = df_model['start_dtm'].clip(lower=year_start, upper=year_end)
+        df_model['end']   = df_model['end_dtm'].clip(lower=year_start, upper=year_end)
+        df_model['end']   = df_model['end'] + pd.Timedelta(minutes=1)
 
-    events = (
-        events.groupby(['acuity_name', 'interval'], as_index=False)['delta']
-        .sum()
-        .sort_values(['acuity_name', 'interval'])
-    )
+        # --------------------------------------------------
+        # EVENT ENGINE
+        # --------------------------------------------------
 
-    # --------------------------------------------------
-    # BUILD TIME GRID
-    # --------------------------------------------------
+        start_events = df_model[['group_name', 'start']].rename(columns={'start': 'interval'})
+        start_events['delta'] = 1
 
-    base = pd.MultiIndex.from_product(
-        [acuities, intervals],
-        names=['acuity_name', 'interval']
-    ).to_frame(index=False)
+        end_events = df_model[['group_name', 'end']].rename(columns={'end': 'interval'})
+        end_events['delta'] = -1
 
-    ts = base.merge(events, on=['acuity_name', 'interval'], how='left')
-    ts['delta'] = ts['delta'].fillna(0)
+        events = pd.concat([start_events, end_events])
 
-    # --------------------------------------------------
-    # BASELINE CARRYOVER
-    # --------------------------------------------------
-
-    initial_counts = (
-        df[
-            (df['start_dtm'] < year_start) &
-            (df['end_dtm'] >= year_start)
+        events = events[
+            (events['interval'] >= year_start) &
+            (events['interval'] <= year_end)
         ]
-        .groupby('acuity_name')
-        .size()
-    )
 
-    # --------------------------------------------------
-    # FINAL CENSUS
-    # --------------------------------------------------
-
-    ts['census'] = ts.groupby('acuity_name')['delta'].cumsum()
-    ts['census'] += ts['acuity_name'].map(initial_counts).fillna(0)
-
-    rmc_emergency_ts = ts[['acuity_name', 'interval', 'census']]
-
-    rmc_emergency_ts["census"] = (
-        pd.to_numeric(rmc_emergency_ts["census"], errors="coerce")
-        .round()
-        .astype("Int64")
-    )
-
-    # --------------------------------------------------
-    # NON-ACUITY ROLLUP (collapse across acuity)
-    # --------------------------------------------------
-
-    rmc_emergency_rollup = (
-        rmc_emergency_ts
-        .groupby("interval", as_index=False)["census"]
-        .sum()
-    )
-
-    # Ensure clean integer typing
-    rmc_emergency_rollup["census"] = (
-        pd.to_numeric(rmc_emergency_rollup["census"], errors="coerce")
-        .round()
-        .astype("Int64")
-    )
-
-    # --------------------------------------------------
-    # EXPORT OUTPUTS (Run folder)
-    # --------------------------------------------------
-
-    # --- ACUITY VERSION ---
-    acuity_output = output_dir / f"{YEAR_PREFIX}_{split}_rmc_emergency_ts.acuity.csv"
-    rmc_emergency_ts.to_csv(acuity_output, index=False)
-
-    log(f"📤 Saved acuity output: {acuity_output} ({len(rmc_emergency_ts):,} rows)")
-
-    # --- NON-ACUITY ROLLUP ---
-    rollup_output = output_dir / f"{YEAR_PREFIX}_{split}_rmc_emergency_ts.non-acuity-rollup.csv"
-    rmc_emergency_rollup.to_csv(rollup_output, index=False)
-
-    log(f"📤 Saved rollup output: {rollup_output} ({len(rmc_emergency_rollup):,} rows)")
-
-    # Per-acuity
-    for acuity, sub_df in rmc_emergency_ts.groupby('acuity_name'):
-        safe_name = acuity.replace(' ', '_').replace('-', '_')
-        file_path = output_dir / f"{YEAR_PREFIX}_{split}_rmc_ed_{safe_name}.csv"
-        sub_df.to_csv(file_path, index=False)
-        log(f"📤 Saved acuity file: {file_path}")  
-
-    # --------------------------------------------------
-    # WRITE HYPER FILES
-    # --------------------------------------------------
-
-    def write_census_hyper(df_out, path):
-        log(f"🧱 Writing census hyper: {path}")
-
-        table = TableDefinition(
-            table_name=TableName("Extract", "Extract"),
-            columns=[
-                TableDefinition.Column("acuity_name", SqlType.text()),
-                TableDefinition.Column("interval", SqlType.timestamp()),
-                TableDefinition.Column("census", SqlType.big_int()),
-            ]
-        )
-
-        with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            with Connection(
-                endpoint=hyper.endpoint,
-                database=path,
-                create_mode=CreateMode.CREATE_AND_REPLACE
-            ) as conn:
-
-                conn.catalog.create_schema("Extract")
-                conn.catalog.create_table(table)
-
-                with Inserter(conn, table) as inserter:
-                    rows = [
-                        (
-                            r[0],              # acuity_name
-                            r[1],              # interval
-                            int(r[2]) if r[2] is not None else None  # census ✅ FORCE PYTHON INT
-                        )
-                        for r in df_out.itertuples(index=False, name=None)
-                    ]
-
-                    inserter.add_rows(rows)
-                    inserter.execute()
-
-        log(f"✅ Census hyper written")
-
-
-    def write_uc_hyper(df_raw, path):
-        log(f"🧱 Writing UC hyper: {path}")
-
-        table = TableDefinition(
-            TableName("Extract", "Extract"),
-            [
-                TableDefinition.Column("hdr_mdr", SqlType.text()),
-                TableDefinition.Column("hdr_har", SqlType.text()),
-                TableDefinition.Column("visit_dt", SqlType.date()),
-                TableDefinition.Column("trg_complete_dtm", SqlType.timestamp()),
-                TableDefinition.Column("arrival_dtm", SqlType.timestamp()),
-                TableDefinition.Column("departure_dtm", SqlType.timestamp()),
-                TableDefinition.Column("patient_type", SqlType.text()),
-                TableDefinition.Column("age", SqlType.big_int()),
-                TableDefinition.Column("gender", SqlType.text()),
-                TableDefinition.Column("patient_zipcode", SqlType.text()),
-                TableDefinition.Column("acuity_name", SqlType.text()),
-                TableDefinition.Column("arrival_method", SqlType.text()),
-                TableDefinition.Column("dss_entity", SqlType.text()),
-                TableDefinition.Column("icd10_diagnosis", SqlType.text()),
-                TableDefinition.Column("icd10_px", SqlType.text()),
-                TableDefinition.Column("discharge_status", SqlType.text()),
-                TableDefinition.Column("encounter_count", SqlType.big_int()),
-            ]
+        events = (
+            events.groupby(['group_name', 'interval'], as_index=False)['delta']
+            .sum()
+            .sort_values(['group_name', 'interval'])
         )
 
         # --------------------------------------------------
-        # BUILD DATAFRAME (schema-aligned, no value coercion)
+        # BUILD TIME GRID
         # --------------------------------------------------
 
-        df_uc = pd.DataFrame({
+        # Define stable, sorted group list
+        groups = sorted(df_model['group_name'].dropna().unique())
 
-            # IDs (direct passthrough)
-            "hdr_mdr": df_raw["patient_id"].astype(str),
-            "hdr_har": df_raw["encounter_id"].astype(str),
+        base = pd.MultiIndex.from_product(
+            [groups, intervals],
+            names=['group_name', 'interval']
+        ).to_frame(index=False)
 
-            # Dates / timestamps (typed only)
-            "visit_dt": pd.to_datetime(df_raw["visit_dtm"]).dt.date,
-            "trg_complete_dtm": pd.to_datetime(df_raw["end_dtm"]),
-            "arrival_dtm": pd.to_datetime(df_raw["start_dtm"]),
-            "departure_dtm": pd.to_datetime(df_raw["end_dtm"]),
-
-            # Dimensions (no remapping)
-            "patient_type": df_raw["patient_type"],
-            "age": (
-                pd.to_numeric(df_raw["patient_age"], errors="coerce")
-                .round()
-                .astype("Int64")
-            ),
-            "gender": df_raw["patient_gender"],
-            "patient_zipcode": df_raw["patient_zipcode"],
-
-            "acuity_name": df_raw["acuity_name"],  # from your earlier normalization
-
-            "arrival_method": df_raw["arrival_method"],
-            "dss_entity": df_raw["facility_name"],
-
-            # Clinical
-            "icd10_diagnosis": df_raw["principal_diagnosis"],
-            "icd10_px": df_raw["principal_procedure"],
-
-            # Disposition
-            "discharge_status": df_raw["disch_disp_desc"],
-
-            # Measure (required)
-            "encounter_count": 1
-        })
-
-        # ✅ CRITICAL: preserve NULLs for Hyper/Tableau
-        df_uc = df_uc.where(pd.notnull(df_uc), None)
-
-        text_cols = [
-            "hdr_mdr", "hdr_har", "patient_type", "gender",
-            "patient_zipcode", "acuity_name", "arrival_method",
-            "dss_entity", "icd10_diagnosis", "icd10_px",
-            "discharge_status"
-        ]
-
-        for col in text_cols:
-            df_uc[col] = df_uc[col].astype(object).where(pd.notna(df_uc[col]), None)
+        ts = base.merge(events, on=['group_name', 'interval'], how='left')
+        ts['delta'] = ts['delta'].fillna(0)
 
         # --------------------------------------------------
-        # WRITE TO HYPER
+        # BASELINE CARRYOVER
         # --------------------------------------------------
 
-        with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            with Connection(
-                endpoint=hyper.endpoint,
-                database=path,
-                create_mode=CreateMode.CREATE_AND_REPLACE
-            ) as conn:
+        initial_counts = (
+            df_model[
+                (df_model['start_dtm'] < year_start) &
+                (df_model['end_dtm'] >= year_start)
+            ]
+            .groupby('group_name')
+            .size()
+        )
 
-                conn.catalog.create_schema("Extract")
-                conn.catalog.create_table(table)
+        # --------------------------------------------------
+        # FINAL CENSUS
+        # --------------------------------------------------
 
-                with Inserter(conn, table) as inserter:
-                    rows = []
-                    for r in df_uc.itertuples(index=False):
+        ts['census'] = ts.groupby('group_name')['delta'].cumsum()
+        ts['census'] += ts['group_name'].map(initial_counts).fillna(0)
 
-                        rows.append((
-                            r.hdr_mdr,
-                            r.hdr_har,
-                            r.visit_dt,
-                            r.trg_complete_dtm,
-                            r.arrival_dtm,
-                            r.departure_dtm,
-                            r.patient_type,
-                            int(r.age) if pd.notna(r.age) else None,
-                            r.gender,
-                            r.patient_zipcode,
-                            r.acuity_name,
-                            r.arrival_method,
-                            r.dss_entity,
-                            r.icd10_diagnosis,
-                            r.icd10_px,
-                            r.discharge_status,
-                            1
-                        ))
+        rmc_emergency_ts = ts[['group_name', 'interval', 'census']]
 
-                    inserter.add_rows(rows)
-                    inserter.execute()
+        rmc_emergency_ts["census"] = (
+            pd.to_numeric(rmc_emergency_ts["census"], errors="coerce")
+            .round()
+            .astype("Int64")
+        )
 
-        log(f"✅ UC hyper written")
+        # --------------------------------------------------
+        # NON-GROUP ROLLUP (collapse across group)
+        # --------------------------------------------------
 
-
-    # --------------------------------------------------
-    # EXECUTE HYPER WRITES
-    # --------------------------------------------------
-
-    census_hyper_path = output_dir / f"{YEAR_PREFIX}_{split}_ed_census.hyper"
-    uc_hyper_path = output_dir / f"{YEAR_PREFIX}_{split}_ed_uc.hyper"
-
-    try:
-        write_census_hyper(rmc_emergency_ts, census_hyper_path)
-    except Exception as e:
-        log(f"❌ Census hyper FAILED: {e}")
-
-    try:
-        write_uc_hyper(df, uc_hyper_path)
-    except Exception as e:
-        log(f"❌ UC hyper FAILED: {e}")
-
-    # --------------------------------------------------
-    # EXPORT PER-YEAR OUTPUTS
-    # --------------------------------------------------
-
-    log("📆 Creating per-year outputs...")
-
-    # Add year column once
-    rmc_emergency_ts["year"] = rmc_emergency_ts["interval"].dt.year
-
-    for year, year_df in rmc_emergency_ts.groupby("year"):
-
-        # ---- FULL YEAR FILE ----
-        year_output = output_dir / f"{year}_rmc_emergency_ts.csv"
-        year_df.drop(columns=["year"]).to_csv(year_output, index=False)
-
-        log(f"📤 Saved yearly output: {year_output} ({len(year_df):,} rows)")
-
-        # ---- PER-ACUITY WITHIN YEAR ----
-        for acuity, sub_df in year_df.groupby("acuity_name"):
-            safe_name = acuity.replace(" ", "_").replace("-", "_")
-
-            file_path = output_dir / f"{year}_{split}_rmc_ed_{safe_name}.csv"
-            sub_df.drop(columns=["year"]).to_csv(file_path, index=False)
-
-            log(f"📤 Saved yearly acuity file: {file_path}")
-
-        # ---- NON-ACUITY YEAR ROLLUP ----
-        year_rollup = (
-            year_df
+        rmc_emergency_rollup = (
+            rmc_emergency_ts
             .groupby("interval", as_index=False)["census"]
             .sum()
         )
 
-        year_rollup_output = output_dir / f"{year}_{split}_rmc_emergency_ts.non-acuity-rollup.csv"
-        year_rollup.to_csv(year_rollup_output, index=False)
+        # Ensure clean integer typing
+        rmc_emergency_rollup["census"] = (
+            pd.to_numeric(rmc_emergency_rollup["census"], errors="coerce")
+            .round()
+            .astype("Int64")
+        )
 
-        log(f"📤 Saved yearly rollup: {year_rollup_output}")
+        # --------------------------------------------------
+        # EXPORT OUTPUTS (Run folder)
+        # --------------------------------------------------
 
-        # ---- HYPER OUTPUTS PER YEAR ----
+        # --- GROUP VERSION ---
+        suffix = "acuity" if group_col == "acuity_name" else "room_category"
+        group_output = output_dir / f"{YEAR_PREFIX}_{split}_rmc_emergency_ts.{suffix}.csv"
+        rmc_emergency_ts.to_csv(group_output, index=False)
 
-        # Acuity Hyper (same schema as main)
-        year_hyper_path = output_dir / f"{year}_ed_census.hyper"
+        log(f"📤 Saved group output: {group_output} ({len(rmc_emergency_ts):,} rows)")
 
-        try:
-            write_census_hyper(
-                year_df.drop(columns=["year"]),
-                year_hyper_path
+        # --- NON-GROUP ROLLUP ---
+        rollup_output = output_dir / f"{YEAR_PREFIX}_{split}_{suffix}_rmc_emergency_ts.rollup.csv"
+        rmc_emergency_rollup.to_csv(rollup_output, index=False)
+
+        log(f"📤 Saved rollup output: {rollup_output} ({len(rmc_emergency_rollup):,} rows)")
+
+        # Per-group
+        for group, sub_df in rmc_emergency_ts.groupby('group_name'):
+            safe_name = re.sub(r'[^A-Za-z0-9_]+', '_', group)
+            safe_name = re.sub(r'_+', '_', safe_name).strip('_')
+            file_path = output_dir / f"{YEAR_PREFIX}_{split}_{suffix}_rmc_ed_{safe_name}.csv"
+            sub_df.to_csv(file_path, index=False)
+            log(f"📤 Saved group file: {file_path}")  
+
+        # --------------------------------------------------
+        # WRITE HYPER FILES
+        # --------------------------------------------------
+
+        def write_census_hyper(df_out, path):
+            log(f"🧱 Writing census hyper: {path}")
+
+            table = TableDefinition(
+                table_name=TableName("Extract", "Extract"),
+                columns=[
+                    TableDefinition.Column("group_name", SqlType.text()),
+                    TableDefinition.Column("interval", SqlType.timestamp()),
+                    TableDefinition.Column("census", SqlType.big_int()),
+                ]
             )
+
+            with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+                with Connection(
+                    endpoint=hyper.endpoint,
+                    database=path,
+                    create_mode=CreateMode.CREATE_AND_REPLACE
+                ) as conn:
+
+                    conn.catalog.create_schema("Extract")
+                    conn.catalog.create_table(table)
+
+                    with Inserter(conn, table) as inserter:
+                        rows = [
+                            (
+                                r[0],              # group_name
+                                r[1],              # interval
+                                int(r[2]) if r[2] is not None else None  # census ✅ FORCE PYTHON INT
+                            )
+                            for r in df_out.itertuples(index=False, name=None)
+                        ]
+
+                        inserter.add_rows(rows)
+                        inserter.execute()
+
+            log(f"✅ Census hyper written")
+
+
+        def write_uc_hyper(df_raw, path):
+            log(f"🧱 Writing UC hyper: {path}")
+
+            table = TableDefinition(
+                TableName("Extract", "Extract"),
+                [
+                    TableDefinition.Column("hdr_mdr", SqlType.text()),
+                    TableDefinition.Column("hdr_har", SqlType.text()),
+                    TableDefinition.Column("visit_dt", SqlType.date()),
+                    TableDefinition.Column("trg_complete_dtm", SqlType.timestamp()),
+                    TableDefinition.Column("arrival_dtm", SqlType.timestamp()),
+                    TableDefinition.Column("departure_dtm", SqlType.timestamp()),
+                    TableDefinition.Column("patient_type", SqlType.text()),
+                    TableDefinition.Column("age", SqlType.big_int()),
+                    TableDefinition.Column("gender", SqlType.text()),
+                    TableDefinition.Column("patient_zipcode", SqlType.text()),
+                    TableDefinition.Column("acuity_name", SqlType.text()),
+                    TableDefinition.Column("room_category", SqlType.text()),
+                    TableDefinition.Column("arrival_method", SqlType.text()),
+                    TableDefinition.Column("dss_entity", SqlType.text()),
+                    TableDefinition.Column("icd10_diagnosis", SqlType.text()),
+                    TableDefinition.Column("icd10_px", SqlType.text()),
+                    TableDefinition.Column("discharge_status", SqlType.text()),
+                    TableDefinition.Column("encounter_count", SqlType.big_int()),
+                ]
+            )
+
+            # --------------------------------------------------
+            # BUILD DATAFRAME (schema-aligned, no value coercion)
+            # --------------------------------------------------
+
+            df_uc = pd.DataFrame({
+
+                # IDs (direct passthrough)
+                "hdr_mdr": df_raw["patient_id"].astype(str),
+                "hdr_har": df_raw["encounter_id"].astype(str),
+
+                # Dates / timestamps (typed only)
+                "visit_dt": pd.to_datetime(df_raw["visit_dtm"]).dt.date,
+                "trg_complete_dtm": pd.to_datetime(df_raw["end_dtm"]),
+                "arrival_dtm": pd.to_datetime(df_raw["start_dtm"]),
+                "departure_dtm": pd.to_datetime(df_raw["end_dtm"]),
+
+                # Dimensions (no remapping)
+                "patient_type": df_raw["patient_type"],
+                "age": (
+                    pd.to_numeric(df_raw["patient_age"], errors="coerce")
+                    .round()
+                    .astype("Int64")
+                ),
+                "gender": df_raw["patient_gender"],
+                "patient_zipcode": df_raw["patient_zipcode"],
+
+                "acuity_name": df_raw["acuity_name"],  # from your earlier normalization
+
+                "room_category": df_raw["room_category"],
+                "arrival_method": df_raw["arrival_method"],
+                "dss_entity": df_raw["facility_name"],
+
+                # Clinical
+                "icd10_diagnosis": df_raw["principal_diagnosis"],
+                "icd10_px": df_raw["principal_procedure"],
+
+                # Disposition
+                "discharge_status": df_raw["disch_disp_desc"],
+
+                # Measure (required)
+                "encounter_count": 1
+            })
+
+            # ✅ CRITICAL: preserve NULLs for Hyper/Tableau
+            df_uc = df_uc.where(pd.notnull(df_uc), None)
+
+            text_cols = [
+                "hdr_mdr", "hdr_har", "patient_type", "gender",
+                "patient_zipcode", "acuity_name", "arrival_method",
+                "dss_entity", "icd10_diagnosis", "icd10_px",
+                "discharge_status","room_category"
+            ]
+
+            for col in text_cols:
+                df_uc[col] = df_uc[col].astype(object).where(pd.notna(df_uc[col]), None)
+
+            # --------------------------------------------------
+            # WRITE TO HYPER
+            # --------------------------------------------------
+
+            with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+                with Connection(
+                    endpoint=hyper.endpoint,
+                    database=path,
+                    create_mode=CreateMode.CREATE_AND_REPLACE
+                ) as conn:
+
+                    conn.catalog.create_schema("Extract")
+                    conn.catalog.create_table(table)
+
+                    with Inserter(conn, table) as inserter:
+                        rows = []
+                        for r in df_uc.itertuples(index=False):
+
+                            rows.append((
+                                r.hdr_mdr,
+                                r.hdr_har,
+                                r.visit_dt,
+                                r.trg_complete_dtm,
+                                r.arrival_dtm,
+                                r.departure_dtm,
+                                r.patient_type,
+                                int(r.age) if pd.notna(r.age) else None,
+                                r.gender,
+                                r.patient_zipcode,
+                                r.acuity_name,
+                                r.room_category,
+                                r.arrival_method,
+                                r.dss_entity,
+                                r.icd10_diagnosis,
+                                r.icd10_px,
+                                r.discharge_status,
+                                1
+                            ))
+
+                        inserter.add_rows(rows)
+                        inserter.execute()
+
+            log(f"✅ UC hyper written")
+
+        # --------------------------------------------------
+        # EXPORT PER-YEAR OUTPUTS
+        # --------------------------------------------------
+
+        log("📆 Creating per-year outputs...")
+
+        # Add year column once
+        rmc_emergency_ts["year"] = rmc_emergency_ts["interval"].dt.year
+
+        for year, year_df in rmc_emergency_ts.groupby("year"):
+
+            # ---- FULL YEAR FILE ----
+            year_output = output_dir / f"{year}_{split}_{suffix}_rmc_emergency_ts.csv"
+            year_df.drop(columns=["year"]).to_csv(year_output, index=False)
+
+            log(f"📤 Saved yearly output: {year_output} ({len(year_df):,} rows)")
+
+            # ---- PER-GROUP WITHIN YEAR ----
+            for group, sub_df in year_df.groupby("group_name"):
+                safe_name = re.sub(r'[^A-Za-z0-9_]+', '_', group)
+                safe_name = re.sub(r'_+', '_', safe_name).strip('_')
+
+                file_path = output_dir / f"{year}_{split}_{suffix}_rmc_ed_{safe_name}.csv"
+                sub_df.drop(columns=["year"]).to_csv(file_path, index=False)
+
+                log(f"📤 Saved yearly group file: {file_path}")
+
+            # ---- NON-GROUP YEAR ROLLUP ----
+            year_rollup = (
+                year_df
+                .groupby("interval", as_index=False)["census"]
+                .sum()
+            )
+
+            year_rollup_output = output_dir / f"{year}_{split}_{suffix}_rmc_emergency_ts.rollup.csv"
+            year_rollup.to_csv(year_rollup_output, index=False)
+
+            log(f"📤 Saved yearly rollup: {year_rollup_output}")
+
+            # ---- HYPER OUTPUTS PER YEAR ----
+
+            # Group Hyper (same schema as main)
+            year_hyper_path = output_dir / f"{year}_{split}_{suffix}_ed_census.hyper"
+
+            try:
+                write_census_hyper(
+                    year_df.drop(columns=["year"]),
+                    year_hyper_path
+                )
+            except Exception as e:
+                log(f"❌ Year {year} census hyper FAILED: {e}")
+
+        # --------------------------------------------------
+        # EXECUTE CENSUS HYPER WRITE
+        # --------------------------------------------------
+        census_hyper_path = output_dir / f"{YEAR_PREFIX}_{split}_ed_census_{suffix}.hyper"
+        try:
+            write_census_hyper(rmc_emergency_ts, census_hyper_path)
         except Exception as e:
-            log(f"❌ Year {year} census hyper FAILED: {e}")
+            log(f"❌ Census hyper FAILED: {e}")
+
+    # --------------------------------------------------
+    # EXECUTE UC HYPER WRITE
+    # --------------------------------------------------
+    uc_hyper_path = output_dir / f"{YEAR_PREFIX}_{split}_ed_uc.hyper"
+    try:
+        write_uc_hyper(df, uc_hyper_path)
+    except Exception as e:
+        log(f"❌ UC hyper FAILED: {e}")
 
 # --------------------------------------------------
 # FINALIZE
